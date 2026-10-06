@@ -1,0 +1,1199 @@
+diff -ruN -x Debug -x _ide orig/fw/noos/drivers/rf-transceiver/ad9361/ad9361_api.c fw/noos/drivers/rf-transceiver/ad9361/ad9361_api.c
+--- orig/fw/noos/drivers/rf-transceiver/ad9361/ad9361_api.c	2026-09-11 11:18:24.000000000 +0000
++++ fw/noos/drivers/rf-transceiver/ad9361/ad9361_api.c	2026-10-01 09:37:04.529082661 +0000
+@@ -48,6 +48,7 @@
+ #include "../../../include/no_os_alloc.h"
+ #include "../../../../ad9361/src/app_config.h"
+ #include <string.h>
++#include "xil_printf.h" /* 5E-HTE: khai bao cho dong debug xil_printf(PRODUCT_ID) them vao ad9361_init() - tranh implicit declaration */
+ #ifndef AXI_ADC_NOT_PRESENT
+ #include "../../axi_core/axi_adc_core/axi_adc_core.h"
+ #include "../../axi_core/axi_dac_core/axi_dac_core.h"
+diff -ruN -x Debug -x _ide orig/fw/src/ad9361_phy.h fw/src/ad9361_phy.h
+--- orig/fw/src/ad9361_phy.h	2026-09-08 17:38:24.000000000 +0000
++++ fw/src/ad9361_phy.h	2026-10-01 09:03:49.466202391 +0000
+@@ -1,15 +1,23 @@
+ /*******************************************************************************
+  * @file    ad9361_phy.h
+- * @brief   Phase 2 hook only. The AD9361 bring-up itself lives directly in
+- *          main.c (not in a separate module) - this header exists solely so
+- *          something wiring AD9361 runtime control (frequency/gain/sampling
+- *          -rate changes) into the RS422/PC command dispatcher later can
+- *          reach the initialized phy handle without main.c needing to
+- *          expose anything else.
++ * @brief   Shared AD9361 state between main.c (which owns the bring-up) and
++ *          the rest of the firmware.
++ *
++ *          - g_ad9361_phy: the initialized phy handle (hook for future
++ *            runtime control - frequency/gain changes wired into the
++ *            RS422/PC command dispatcher).
++ *          - g_rf_status: RX configuration read back from the chip ONCE at
++ *            the end of Ad9361_Bringup(), BEFORE BoardApp_Init() reclaims
++ *            the shared SPI0 controller for the F1956 attenuators. The
++ *            RF status report ("RFST", cmd_dispatcher.c) is built from this
++ *            cache only - nothing reads the AD9361 over SPI at runtime (see
++ *            board_app.c SHARED-SPI-BUS NOTE).
+  ******************************************************************************/
+ #ifndef AD9361_PHY_H
+ #define AD9361_PHY_H
+ 
++#include <stdint.h>
++
+ struct ad9361_rf_phy;
+ 
+ /* Set by main.c once ad9361_init() succeeds during boot. NULL until then
+@@ -17,4 +25,16 @@
+  * before BoardApp_Init() ever runs - see main.c). */
+ extern struct ad9361_rf_phy *g_ad9361_phy;
+ 
++typedef struct {
++    uint8_t  valid;         /* 1 once Ad9361_Bringup() filled it in        */
++    uint64_t rx_lo_hz;
++    uint32_t rx_fs_hz;
++    uint32_t rx_bw_hz;
++    int32_t  rx1_gain_db;
++    uint8_t  gain_mode;     /* enum rf_gain_ctrl_mode value                */
++} ad9361_rf_status_t;
++
++/* Defined in main.c. */
++extern ad9361_rf_status_t g_rf_status;
++
+ #endif /* AD9361_PHY_H */
+diff -ruN -x Debug -x _ide orig/fw/src/board_app.c fw/src/board_app.c
+--- orig/fw/src/board_app.c	2026-09-11 15:49:58.000000000 +0000
++++ fw/src/board_app.c	2026-10-01 09:05:41.363967395 +0000
+@@ -7,6 +7,8 @@
+  *
+  *          Called from main.c as BoardApp_Init() (once, after AD9361 setup)
+  *          then BoardApp_PollOnce() (once per pass of main()'s superloop).
++ *          Periodic work (ADC7928 telemetry, RF "WAVE" spectrum, "RFST" RX
++ *          config report) is scheduled on the ARMv8 global timer (XTime).
+  *
+  *          IMPORTANT FINDING (see board_config.h for the full note): the
+  *          xparameters.h you supplied wires NO interrupt line for any of
+@@ -55,7 +57,7 @@
+ #include "xscugic.h"
+ #include "xil_exception.h"
+ #include "xil_printf.h"
+-#include "circularBuffer.h"
++#include "xtime_l.h"  /* XTime_GetTime()/COUNTS_PER_SECOND - ARMv8 global timer */
+ 
+ #include "board_config.h"
+ #include "board_app.h"
+@@ -66,22 +68,29 @@
+ #include "stream_framer.h"
+ 
+ #define RAW_SIZE                1
+-#define PC_RX_BUFFER_CAPACITY   1024
+ 
+-/* ADC7928 telemetry period, expressed as a count of idle-loop passes (each
+- * idle pass sleeps ADC_POLL_IDLE_SLEEP_US us when there is no RX byte
+- * pending). This is a simple cooperative scheduler, not a hardware timer -
+- * good enough for a ~1s human-facing telemetry rate; swap in an XScuTimer
+- * if tighter timing is ever needed. */
+-#define ADC_POLL_IDLE_SLEEP_US     20
+-#define ADC_POLL_IDLE_COUNT        50000U  /* ~1s @ 20us/iter when idle    */
+-
+-/* RF FFT spectrum streaming period (stream_framer.c), same cooperative
+- * idle-pass scheduling as the ADC7928 telemetry above but on its own
+- * independent counter/period - user confirmed continuous background
+- * streaming every ~200-500ms (32-point FFT, RX1), so ~300ms is picked as a
+- * middle value: 300000us / 20us = 15000 idle passes. */
+-#define RF_WAVE_POLL_IDLE_COUNT    15000U  /* ~300ms @ 20us/iter when idle */
++/* Software RX ring for the RS422/PC link (power of two). Filled by the UART
++ * ISR when UART_PC_HAS_INTR==1, or by BoardApp_ServiceRx() in polled mode;
++ * drained one byte per BoardApp_PollOnce(). Single producer/single consumer
++ * on one core, so plain volatile indices are enough (no locking). */
++#define PC_RX_RING_SIZE         1024U
++#define PC_RX_RING_MASK         (PC_RX_RING_SIZE - 1U)
++
++/* Periodic tasks, scheduled on the ARMv8 global timer (XTime) instead of
++ * the old "count idle passes" scheme: that one restarted from zero on every
++ * received byte, so steady PC traffic (e.g. the app's PING every 2 s plus a
++ * few commands) could delay telemetry/spectrum indefinitely, and its real
++ * period drifted with loop overhead.
++ *  - ADC7928 telemetry: ~1 s (human-facing rate).
++ *  - RF spectrum ("WAVE"): ~300 ms - user-confirmed 200..500 ms range,
++ *    32-point FFT, RX1.
++ *  - RF config report ("RFST"): every ~3 s, so an app that connects AFTER
++ *    the board booted still learns LO/sample rate within a few seconds. */
++#define ADC_TELEMETRY_PERIOD_MS    1000U
++#define RF_WAVE_PERIOD_MS          300U
++#define RF_STATUS_PERIOD_MS        3000U
++#define IDLE_SLEEP_US              20U      /* nothing to do this pass        */
++#define DELAY_SERVICE_CHUNK_US     50U      /* BoardApp_DelayUs() granularity */
+ 
+ #if UART_PC_HAS_INTR
+ /* This project's only GIC user (AD9361 bring-up in main.c does not need
+@@ -94,12 +103,50 @@
+ static XUartNs550 UartDcPwr;
+ static XUartNs550 UartPc;
+ 
+-static uint32_t idle_count    = 0U;
+-static uint32_t rf_idle_count = 0U;
++/* Set only once the RS422/PC link is up - BoardApp_PollOnce() is a no-op
++ * before that (previously a failed BoardApp_Init() returned early and the
++ * superloop then polled an uninitialized UART at base address 0). */
++static int s_pc_link_ready = 0;
++
++static volatile uint8_t  s_rx_ring[PC_RX_RING_SIZE];
++static volatile uint32_t s_rx_head = 0U;   /* producer index */
++static volatile uint32_t s_rx_tail = 0U;   /* consumer index */
++static volatile uint32_t s_rx_dropped = 0U;
++
++static XTime s_next_adc_tick;
++static XTime s_next_wave_tick;
++static XTime s_next_rfst_tick;
++static int   s_adc_ok = 0;
++static int   s_rf_stream_ok = 0;
++
++static void RxRing_Push(uint8_t b)
++{
++    uint32_t next = (s_rx_head + 1U) & PC_RX_RING_MASK;
++    if (next == s_rx_tail) {
++        s_rx_dropped++;                 /* full: drop newest, keep counting */
++        return;
++    }
++    s_rx_ring[s_rx_head] = b;
++    s_rx_head = next;
++}
++
++static int RxRing_Pop(uint8_t *b)
++{
++    if (s_rx_tail == s_rx_head) {
++        return 0;
++    }
++    *b = s_rx_ring[s_rx_tail];
++    s_rx_tail = (s_rx_tail + 1U) & PC_RX_RING_MASK;
++    return 1;
++}
++
++static XTime MsToTicks(uint32_t ms)
++{
++    return ((XTime)COUNTS_PER_SECOND / 1000U) * (XTime)ms;
++}
+ 
+ #if UART_PC_HAS_INTR
+-static uint8_t         g_RxBytePc[RAW_SIZE];
+-static circular_buffer g_pcRxBuffer;
++static uint8_t g_RxBytePc[RAW_SIZE];
+ 
+ static volatile int TotalReceivedCount;
+ static volatile int TotalSentCount;
+@@ -157,104 +204,144 @@
+ 
+ void BoardApp_Init(void)
+ {
+-    if (Attenuator_Init() != XST_SUCCESS) {
+-        xil_printf("Loi: Khoi tao SPI/GPIO suy hao (F1956)!\r\n");
+-        return;
+-    }
+-    if (OpticalDelay_Init() != XST_SUCCESS) {
+-        xil_printf("Loi: Khoi tao GPIO delay quang!\r\n");
+-        return;
++    int att_ok, odly_ok, ac_ok, dc_ok;
++    XTime now;
++
++    /* Order matters for the shared SPI0 controller (see file header): the
++     * attenuator init must run after Ad9361_Bringup(), which main.c already
++     * guarantees. Device failures below are NOT fatal any more: the RS422/PC
++     * link is still brought up so the Qt app can talk to the board and gets
++     * a NACK for the failed device, instead of the whole board going silent
++     * (old behaviour: return early -> no PC link at all). Only a PC-link
++     * failure is fatal, since then nothing can be controlled anyway. */
++    att_ok = (Attenuator_Init() == XST_SUCCESS);
++    if (!att_ok) {
++        xil_printf("Loi: Khoi tao SPI/GPIO suy hao (F1956) - lenh ATT se bi NACK.\r\n");
++    }
++    odly_ok = (OpticalDelay_Init() == XST_SUCCESS);
++    if (!odly_ok) {
++        xil_printf("Loi: Khoi tao GPIO delay quang - lenh DELAY se bi NACK.\r\n");
+     }
+-    if (ADC7928_Init() != XST_SUCCESS) {
+-        /* Not fatal to the rest of the system - report and keep going so
+-         * AC/DC/ATT/delay control still work even if the ADC7928 bus has a
+-         * problem. */
++    s_adc_ok = (ADC7928_Init() == XST_SUCCESS);
++    if (!s_adc_ok) {
+         xil_printf("Canh bao: Khoi tao ADC7928 that bai, tiep tuc khong co telemetry ADC.\r\n");
+     }
+-    if (StreamFramer_Init() != XST_SUCCESS) {
+-        /* Also not fatal - same reasoning as ADC7928 above. Must run after
+-         * Ad9361_Bringup() in main.c has already brought up the RX AXI-ADC
+-         * core + its DMA channel (see stream_framer.h), which BoardApp_Init()
+-         * always does since it only ever runs after that point. */
++    /* Must run after Ad9361_Bringup() has brought up the RX AXI-ADC core
++     * (see stream_framer.h) - always true here. */
++    s_rf_stream_ok = (StreamFramer_Init() == XST_SUCCESS);
++    if (!s_rf_stream_ok) {
+         xil_printf("Canh bao: Khoi tao RX DMA (RF spectrum) that bai, tiep tuc khong co WAVE streaming.\r\n");
+     }
+ 
+-    /* 115200 for all 3 UARTs, matching the already-validated
+-     * src_att_pwr_odly/main.cpp exactly. TODO(confirm): if the real AC/DC
+-     * bench supplies are documented at a different baud rate, change only
+-     * the two constants below. */
+-    if (UART_InitTxOnly(&UartAcPwr, UART_AC_PWR_DEVICE_ID, 115200) != XST_SUCCESS) {
+-        xil_printf("Loi: Khoi tao UART AC PWR!\r\n");
+-        return;
+-    }
+-    if (UART_InitTxOnly(&UartDcPwr, UART_DC_PWR_DEVICE_ID, 115200) != XST_SUCCESS) {
+-        xil_printf("Loi: Khoi tao UART DC PWR!\r\n");
+-        return;
++    /* Bench-supply UART baud rates come from board_config.h
++     * (UART_AC_PWR_BAUDRATE / UART_DC_PWR_BAUDRATE) - previously hardcoded
++     * 115200 here, so changing the macros had no effect. */
++    ac_ok = (UART_InitTxOnly(&UartAcPwr, UART_AC_PWR_DEVICE_ID, UART_AC_PWR_BAUDRATE) == XST_SUCCESS);
++    if (!ac_ok) {
++        xil_printf("Loi: Khoi tao UART AC PWR - lenh AC se bi NACK.\r\n");
++    }
++    dc_ok = (UART_InitTxOnly(&UartDcPwr, UART_DC_PWR_DEVICE_ID, UART_DC_PWR_BAUDRATE) == XST_SUCCESS);
++    if (!dc_ok) {
++        xil_printf("Loi: Khoi tao UART DC PWR - lenh DC se bi NACK.\r\n");
+     }
+     if (UART_InitPcLink(&UartPc, UART_PC_DEVICE_ID, UART_PC_BAUDRATE) != XST_SUCCESS) {
+-        xil_printf("Loi: Khoi tao UART RS422 PC!\r\n");
++        xil_printf("Loi nghiem trong: Khoi tao UART RS422 PC that bai - khong the giao tiep voi app.\r\n");
+         return;
+     }
+ 
+ #if UART_PC_HAS_INTR
+-    cb_init(&g_pcRxBuffer, PC_RX_BUFFER_CAPACITY, sizeof(uint8_t));
+     XUartNs550_Recv(&UartPc, g_RxBytePc, RAW_SIZE);
+     xil_printf("RS422/PC: RX ngat cung (interrupt-driven).\r\n");
+ #else
+     xil_printf("RS422/PC: RX bang polling (khong co ngat kha dung trong xparameters.h).\r\n");
+ #endif
+ 
+-    CmdDispatcher_Init(&UartAcPwr, &UartDcPwr, &UartPc);
++    CmdDispatcher_Init(ac_ok ? &UartAcPwr : NULL,
++                       dc_ok ? &UartDcPwr : NULL,
++                       &UartPc);
++    CmdDispatcher_SetDeviceReady(att_ok, odly_ok);
++
++    XTime_GetTime(&now);
++    s_next_adc_tick  = now + MsToTicks(ADC_TELEMETRY_PERIOD_MS);
++    s_next_wave_tick = now + MsToTicks(RF_WAVE_PERIOD_MS);
++    s_next_rfst_tick = now;                 /* send the RF config right away */
++    s_pc_link_ready  = 1;
++
++    xil_printf("5E-HTE board-app (AC/DC/ATT/Delay/ADC7928/RF) san sang.\r\n");
++}
++
++void BoardApp_ServiceRx(void)
++{
++#if !UART_PC_HAS_INTR
++    /* Polled mode: move everything the UART FIFO holds into the software
++     * ring. Called from the main loop AND from every blocking wait in this
++     * firmware (UART TX, AC/DC command pacing - see BoardApp_DelayUs()), so
++     * host bytes are not lost to a 16-byte hardware FIFO overrun while e.g.
++     * a ~13 ms "WAVE" frame or a ~250 ms AC-supply command sequence is
++     * being sent. In interrupt mode the ISR already does this - no-op. */
++    if (!s_pc_link_ready) {
++        return;
++    }
++    while (XUartNs550_IsReceiveData(UartPc.BaseAddress)) {
++        RxRing_Push((uint8_t)XUartNs550_ReadReg(UartPc.BaseAddress, XUN_RBR_OFFSET));
++    }
++#endif
++}
+ 
+-    xil_printf("5E-HTE board-app (AC/DC/ATT/Delay/ADC7928) san sang.\r\n");
++void BoardApp_DelayUs(uint32_t us)
++{
++    while (us >= DELAY_SERVICE_CHUNK_US) {
++        BoardApp_ServiceRx();
++        usleep(DELAY_SERVICE_CHUNK_US);
++        us -= DELAY_SERVICE_CHUNK_US;
++    }
++    if (us > 0U) {
++        usleep(us);
++    }
++    BoardApp_ServiceRx();
+ }
+ 
+ void BoardApp_PollOnce(void)
+ {
+     uint8_t rx_byte = 0U;
+-    bool    data_available = false;
++    XTime   now;
+ 
+-#if UART_PC_HAS_INTR
+-    Xil_ExceptionDisable();
+-    if (g_pcRxBuffer.count > 0) {
+-        cb_pop_front(&g_pcRxBuffer, &rx_byte);
+-        data_available = true;
+-    }
+-    Xil_ExceptionEnable();
+-#else
+-    if (XUartNs550_IsReceiveData(UartPc.BaseAddress)) {
+-        rx_byte = XUartNs550_ReadReg(UartPc.BaseAddress, XUN_RBR_OFFSET);
+-        data_available = true;
++    if (!s_pc_link_ready) {
++        return;
+     }
+-#endif
+ 
+-    if (data_available) {
++    BoardApp_ServiceRx();
++    if (RxRing_Pop(&rx_byte)) {
+         CmdDispatcher_HandleByte(rx_byte);
+-        idle_count    = 0U;
+-        rf_idle_count = 0U;
+-    } else {
+-        usleep(ADC_POLL_IDLE_SLEEP_US);
+-        idle_count++;
+-        rf_idle_count++;
+-
+-        if (idle_count >= ADC_POLL_IDLE_COUNT) {
+-            idle_count = 0U;
+-            uint16_t codes[ADC7928_NUM_CHANNELS];
+-            if (ADC7928_ReadAll(codes) == XST_SUCCESS) {
+-                CmdDispatcher_SendAdcTelemetry(codes);
+-            }
+-            /* On failure we simply skip this telemetry tick rather than
+-             * spamming stale/garbage data - the next tick will retry. */
+-        }
++        return;                 /* drain host bytes first, tasks next pass */
++    }
+ 
+-        if (rf_idle_count >= RF_WAVE_POLL_IDLE_COUNT) {
+-            rf_idle_count = 0U;
+-            /* On failure (DMA timeout etc.) just skip this tick, same
+-             * non-fatal pattern as the ADC7928 telemetry above - see
+-             * stream_framer.h. */
+-            (void)StreamFramer_CaptureAndSend();
++    XTime_GetTime(&now);
++
++    if (s_adc_ok && (now >= s_next_adc_tick)) {
++        uint16_t codes[ADC7928_NUM_CHANNELS];
++        s_next_adc_tick = now + MsToTicks(ADC_TELEMETRY_PERIOD_MS);
++        if (ADC7928_ReadAll(codes) == XST_SUCCESS) {
++            CmdDispatcher_SendAdcTelemetry(codes);
+         }
++        /* On failure simply skip this tick - next tick retries. */
++        return;
++    }
++
++    if (now >= s_next_rfst_tick) {
++        s_next_rfst_tick = now + MsToTicks(RF_STATUS_PERIOD_MS);
++        CmdDispatcher_SendRfStatus();
++        return;
++    }
++
++    if (s_rf_stream_ok && (now >= s_next_wave_tick)) {
++        s_next_wave_tick = now + MsToTicks(RF_WAVE_PERIOD_MS);
++        /* DMA timeout etc. -> skip this tick (see stream_framer.h). */
++        (void)StreamFramer_CaptureAndSend();
++        return;
+     }
++
++    usleep(IDLE_SLEEP_US);
+ }
+ 
+ #if UART_PC_HAS_INTR
+@@ -269,12 +356,9 @@
+     if (Event == XUN_EVENT_RECV_DATA) {
+         TotalReceivedCount = EventData;
+         if (UartNs550Ptr == &UartPc) {
+-            cb_push_back(&g_pcRxBuffer, &g_RxBytePc[0]);
++            RxRing_Push(g_RxBytePc[0]);
+             while (XUartNs550_IsReceiveData(UartNs550Ptr->BaseAddress)) {
+-                uint8_t real_byte = XUartNs550_ReadReg(UartNs550Ptr->BaseAddress, XUN_RBR_OFFSET);
+-                if (g_pcRxBuffer.count < g_pcRxBuffer.capacity) {
+-                    cb_push_back(&g_pcRxBuffer, &real_byte);
+-                }
++                RxRing_Push((uint8_t)XUartNs550_ReadReg(UartNs550Ptr->BaseAddress, XUN_RBR_OFFSET));
+             }
+             XUartNs550_Recv(&UartPc, g_RxBytePc, RAW_SIZE);
+         }
+diff -ruN -x Debug -x _ide orig/fw/src/board_app.h fw/src/board_app.h
+--- orig/fw/src/board_app.h	2026-09-08 17:38:24.000000000 +0000
++++ fw/src/board_app.h	2026-10-01 09:05:59.686966607 +0000
+@@ -12,6 +12,8 @@
+ #ifndef BOARD_APP_H
+ #define BOARD_APP_H
+ 
++#include <stdint.h>
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -28,11 +30,23 @@
+ void BoardApp_Init(void);
+ 
+ /* Call once per pass of main()'s superloop. Non-blocking: services at most
+- * one incoming RS422/PC byte and, on an idle pass, checks whether it is
+- * time for the next ADC7928 telemetry tick.
++ * one incoming RS422/PC byte and, on an idle pass, runs whichever periodic
++ * task is due (ADC7928 telemetry ~1 s, RF "WAVE" spectrum ~300 ms, "RFST"
++ * RX-config report ~3 s - all timed on the ARMv8 global timer).
+  */
+ void BoardApp_PollOnce(void);
+ 
++/* Polled-RX mode (no UART interrupt wired, UART_PC_HAS_INTR==0): moves any
++ * bytes waiting in the RS422/PC UART's 16-byte hardware FIFO into the
++ * firmware's software RX ring. Called from every blocking wait (UART TX
++ * loops, AC/DC supply command pacing) so host commands are not lost while
++ * the firmware is busy. No-op in interrupt mode and before the link is up. */
++void BoardApp_ServiceRx(void);
++
++/* usleep() replacement for long blocking waits: same minimum delay, but
++ * keeps calling BoardApp_ServiceRx() every ~50 us while waiting. */
++void BoardApp_DelayUs(uint32_t us);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN -x Debug -x _ide orig/fw/src/circularBuffer.h fw/src/circularBuffer.h
+--- orig/fw/src/circularBuffer.h	2026-09-08 17:38:24.000000000 +0000
++++ fw/src/circularBuffer.h	2026-10-01 09:37:04.529870807 +0000
+@@ -15,8 +15,13 @@
+ void cb_init(circular_buffer *cb, size_t capacity, size_t sz)
+ {
+     cb->buffer = malloc(capacity * sz);
+-    if(cb->buffer == NULL)
++    if(cb->buffer == NULL) {
+         // handle error
++    }
++    /* NOTE: the braces above are a bug fix - without them this assignment
++     * was the body of the if (the comment does not end the statement), so
++     * buffer_end was only set when malloc FAILED and head/tail never wrapped.
++     * board_app.c no longer uses this file (own fixed-size RX ring). */
+     cb->buffer_end = (char *)cb->buffer + capacity * sz;
+     cb->capacity = capacity;
+     cb->count = 0;
+diff -ruN -x Debug -x _ide orig/fw/src/cmd_dispatcher.c fw/src/cmd_dispatcher.c
+--- orig/fw/src/cmd_dispatcher.c	2026-09-11 15:49:58.000000000 +0000
++++ fw/src/cmd_dispatcher.c	2026-10-01 09:07:26.649756993 +0000
+@@ -4,12 +4,19 @@
+ #include "device_power.h"
+ #include "device_attenuator.h"
+ #include "device_optical_delay.h"
++#include "board_config.h"
++#include "board_app.h"
++#include "ad9361_phy.h"
++#include "stream_framer.h"
+ #include <string.h>
+ #include <math.h>
+ 
++/* NULL = that bench-supply UART failed to initialize -> its commands NACK. */
+ static XUartNs550 *s_ac_uart;
+ static XUartNs550 *s_dc_uart;
+ static XUartNs550 *s_pc_uart;
++static int         s_att_ready  = 0;
++static int         s_odly_ready = 0;
+ 
+ static vip_status_t s_vip_status;
+ static vip_msg_t    s_vip_rx;
+@@ -24,16 +31,33 @@
+     VIP_Decode_Init(&s_vip_status);
+ }
+ 
++void CmdDispatcher_SetDeviceReady(int att_ready, int odly_ready)
++{
++    s_att_ready  = att_ready;
++    s_odly_ready = odly_ready;
++}
++
+ /* Raw byte-accurate blocking send (payload may contain 0x00, so this can't
+  * be a NUL-terminated Device_UartSendString() call). */
+ static void UartRaw_Send(XUartNs550 *u, const uint8_t *buf, uint32_t len)
+ {
+     uint32_t i;
++
++    if (u == NULL) {
++        return;
++    }
++    /* Keep draining the host->board RX FIFO while we wait on TX (polled RX
++     * mode) - a 150-byte "WAVE" frame alone blocks ~13 ms at 115200 baud,
++     * far longer than the 16-byte RX FIFO lasts (~1.4 ms). */
+     for (i = 0U; i < len; i++) {
+-        while (XUartNs550_IsSending(u));
++        while (XUartNs550_IsSending(u)) {
++            BoardApp_ServiceRx();
++        }
+         XUartNs550_Send(u, (u8 *)&buf[i], 1);
+     }
+-    while (XUartNs550_IsSending(u));
++    while (XUartNs550_IsSending(u)) {
++        BoardApp_ServiceRx();
++    }
+ }
+ 
+ static void SendAck(uint8_t des_id, uint16_t frame_seq, uint8_t inner_seq, uint8_t msgid, uint8_t success)
+@@ -65,9 +89,17 @@
+     memcpy(&fwi, msg->payload64, sizeof(fwi_msg_t));
+ 
+     if (strncmp(fwi.isAC, "AC", 2) == 0) {
++        if (s_ac_uart == NULL) {
++            SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
++            return;
++        }
+         Device_ControlACPwr(s_ac_uart, (float)fwi.voltage, (float)fwi.frequency, fwi.state);
+         success = 1U;
+     } else if (strncmp(fwi.isAC, "DC", 2) == 0) {
++        if (s_dc_uart == NULL) {
++            SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
++            return;
++        }
+         /* The Qt app packs DC current into the same "frequency" field of
+          * fwi_msg_t (see dashboardmanager.cpp setDcPower()) as fixed-point
+          * x100 (centiamps), e.g. 2.35 A -> 235, to avoid the old
+@@ -90,6 +122,10 @@
+         SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+         return;
+     }
++    if (!s_odly_ready) {
++        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
++        return;
++    }
+     memcpy(&d, msg->payload64, sizeof(timedelay_msg_t));
+     success = (uint8_t)OpticalDelay_SetNs((int)d.value);
+     SendAck(src_id, frame_seq, msg->seq, msg->msgid, success);
+@@ -97,28 +133,54 @@
+ 
+ static void HandleAtt(const kria_message_t *msg, uint8_t src_id, uint16_t frame_seq)
+ {
+-    annuation_msg_t a;
+-    uint8_t         success = 0U;
++    uint8_t att_number;
++    float   db;
+ 
+-    if (msg->len != (uint8_t)sizeof(annuation_msg_t)) {
++    /* Two payload formats, told apart by length (see kria_helper.h):
++     *  - 7 bytes annuation_q_msg_t: value_qdb = 0.25 dB steps (current app)
++     *  - 6 bytes annuation_msg_t:   value = whole dB (older app builds)
++     * Anything else, an out-of-range channel, or an out-of-range step count
++     * is NACKed rather than clamped, so a malformed or mismatched command can
++     * never silently land on a different attenuation than the operator asked
++     * for. */
++    if (msg->len == (uint8_t)sizeof(annuation_q_msg_t)) {
++        annuation_q_msg_t q;
++        memcpy(&q, msg->payload64, sizeof(q));
++        if (q.value_qdb > ATT_MAX_STEPS) {
++            SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
++            return;
++        }
++        att_number = q.att_number;
++        db = (float)q.value_qdb * ATT_STEP_DB;
++    } else if (msg->len == (uint8_t)sizeof(annuation_msg_t)) {
++        annuation_msg_t a;
++        memcpy(&a, msg->payload64, sizeof(a));
++        if ((float)a.value > ATT_MAX_DB) {
++            SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
++            return;
++        }
++        att_number = a.att_number;
++        db = (float)a.value;
++    } else {
+         SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+         return;
+     }
+-    memcpy(&a, msg->payload64, sizeof(annuation_msg_t));
+-    if ((a.att_number >= 1U) && (a.att_number <= 3U)) {
+-        Attenuator_SetDb((int)a.att_number, (float)a.value);
+-        success = 1U;
++
++    if (!s_att_ready || (att_number < 1U) || (att_number > 3U)) {
++        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
++        return;
+     }
+-    SendAck(src_id, frame_seq, msg->seq, msg->msgid, success);
++    Attenuator_SetDb((int)att_number, db);
++    SendAck(src_id, frame_seq, msg->seq, msg->msgid, 1U);
+ }
+ 
+ static void HandleGenericCmd(const kria_message_t *msg, uint8_t src_id, uint16_t frame_seq)
+ {
+     /* Generic/diagnostic command channel (msgid 39, host->device). Most
+      * commands here still just get ACKed (no action defined) so the "CMD:"
+-     * box in CommandLogPanel.qml gets a response. AD9361/"WAVE" streaming
+-     * (device -> host, also msgid 39) is out of scope for this delivery -
+-     * see README "Phase 2".
++     * box in CommandLogPanel.qml gets a response. Device -> host traffic on
++     * msgid 39 ("WAVE"/"RFST" streams) is sent by the functions at the end
++     * of this file, never received here.
+      *
+      * "RESET" is now implemented: it restores every output this board
+      * controls to its power-on-safe default (AC/DC OFF, all 3 ATT to
+@@ -136,13 +198,31 @@
+         memcpy(&cmd, msg->payload64, sizeof(cmd_msg_t));
+ 
+         if (strncmp(cmd.msg, "RESET", 5) == 0) {
+-            Device_ControlACPwr(s_ac_uart, 0.0f, 0.0f, 0);
+-            Device_ControlDCPwr(s_dc_uart, 0.0f, 0.0f, 0);
+-            Attenuator_SetDb(1, 0.0f);
+-            Attenuator_SetDb(2, 0.0f);
+-            Attenuator_SetDb(3, 0.0f);
+-            (void)OpticalDelay_SetNs(0);
++            /* Only touch devices that initialized; report failure if any
++             * output could not be returned to its safe default. */
+             success = 1U;
++            if (s_ac_uart != NULL) {
++                Device_ControlACPwr(s_ac_uart, 0.0f, 0.0f, 0);
++            } else {
++                success = 0U;
++            }
++            if (s_dc_uart != NULL) {
++                Device_ControlDCPwr(s_dc_uart, 0.0f, 0.0f, 0);
++            } else {
++                success = 0U;
++            }
++            if (s_att_ready) {
++                Attenuator_SetDb(1, 0.0f);
++                Attenuator_SetDb(2, 0.0f);
++                Attenuator_SetDb(3, 0.0f);
++            } else {
++                success = 0U;
++            }
++            if (s_odly_ready) {
++                (void)OpticalDelay_SetNs(0);
++            } else {
++                success = 0U;
++            }
+         }
+     }
+     SendAck(src_id, frame_seq, msg->seq, msg->msgid, success);
+@@ -271,6 +351,45 @@
+ 
+     inner_len = kria_msg_to_send_buffer(inner, &tx_msg);
+     frame_len = VIP_Encode_Data(VIP_NODE_ID_HOST, VIP_NODE_ID_SELF, VIP_NextTxSeq(),
++                                 inner, inner_len, s_tx_frame, sizeof(s_tx_frame));
++    if (frame_len > 0U) {
++        UartRaw_Send(s_pc_uart, s_tx_frame, frame_len);
++    }
++}
++
++void CmdDispatcher_SendRfStatus(void)
++{
++    rf_status_msg_t st;
++    kria_message_t  tx_msg;
++    uint8_t         inner[3 + sizeof(rf_status_msg_t)];
++    uint16_t        inner_len;
++    uint32_t        frame_len;
++    static uint8_t  seq = 0U;
++
++    if (!g_rf_status.valid) {
++        return;     /* AD9361 bring-up never completed - nothing to report */
++    }
++
++    memset(&st, 0, sizeof(st));
++    memcpy(st.msg, "RFST", 4U);
++    st.rx_lo_hz    = g_rf_status.rx_lo_hz;
++    st.rx_fs_hz    = g_rf_status.rx_fs_hz;
++    st.rx_bw_hz    = g_rf_status.rx_bw_hz;
++    st.rx1_gain_db = g_rf_status.rx1_gain_db;
++    st.gain_mode   = g_rf_status.gain_mode;
++    st.fft_size    = (uint8_t)STREAM_FRAMER_FFT_SIZE;
++    st.adc_bits    = (uint8_t)STREAM_FRAMER_ADC_BITS;
++    st.window      = (uint8_t)STREAM_FRAMER_WINDOW_RECT;
++
++    /* Built by hand (fixed 28-byte payload) for the same reason as "WAVE":
++     * kria_msg_output_encode() hardcodes msgid 39 to sizeof(cmd_msg_t). */
++    tx_msg.seq   = seq++;
++    tx_msg.msgid = 39U;
++    tx_msg.len   = (uint8_t)sizeof(rf_status_msg_t);
++    memcpy(tx_msg.payload64, &st, sizeof(st));
++
++    inner_len = kria_msg_to_send_buffer(inner, &tx_msg);
++    frame_len = VIP_Encode_Data(VIP_NODE_ID_HOST, VIP_NODE_ID_SELF, VIP_NextTxSeq(),
+                                  inner, inner_len, s_tx_frame, sizeof(s_tx_frame));
+     if (frame_len > 0U) {
+         UartRaw_Send(s_pc_uart, s_tx_frame, frame_len);
+diff -ruN -x Debug -x _ide orig/fw/src/cmd_dispatcher.h fw/src/cmd_dispatcher.h
+--- orig/fw/src/cmd_dispatcher.h	2026-09-11 15:49:58.000000000 +0000
++++ fw/src/cmd_dispatcher.h	2026-10-01 09:07:26.650585008 +0000
+@@ -4,7 +4,9 @@
+  *          bytes through the VIP framing decoder (vip_helper.c), unwraps
+  *          the inner kria_message_t (kria_helper.h), dispatches msgid
+  *          35/36/37/38/39 to the AC/DC/attenuator/optical-delay/generic
+- *          device drivers, and sends back the VIP-wrapped ACK frames the
++ *          device drivers, sends device->host telemetry/streams (ADC7928
++ *          msgid 40, "WAVE" and "RFST" on msgid 39), and sends back the
++ *          VIP-wrapped ACK frames the
+  *          Qt dashboard app already expects (payload64[0] = 1 success / 0
+  *          fail on msgid 35..38 - see App/backend/dashboardmanager.cpp
+  *          parseIncomingData()).
+@@ -31,6 +33,12 @@
+  * out on this same UART. */
+ void CmdDispatcher_Init(XUartNs550 *ac_uart, XUartNs550 *dc_uart, XUartNs550 *pc_uart);
+ 
++/* Tells the dispatcher which SPI/GPIO devices initialized. Commands for a
++ * device that did not (ATT / optical delay) are NACKed instead of being
++ * written to half-initialized hardware. ac_uart/dc_uart passed as NULL to
++ * CmdDispatcher_Init() mean the same for the AC/DC supplies. */
++void CmdDispatcher_SetDeviceReady(int att_ready, int odly_ready);
++
+ /* Feed one byte received from the PC/RS422 UART (called from the main
+  * superloop after popping a byte out of the ISR-fed circular buffer - see
+  * main.cpp). Runs the VIP decode state machine and, once a full frame is
+@@ -54,6 +62,12 @@
+  * there is no fragmentation scheme on either end of this link. */
+ void CmdDispatcher_SendWaveSpectrum(const float *magnitudes, uint32_t count);
+ 
++/* Sends the cached AD9361 RX configuration (g_rf_status, filled once by
++ * main.c's Ad9361_Bringup()) as an "RFST" frame (msgid 39, rf_status_msg_t)
++ * so the app can label the "WAVE" spectrum with real frequencies. No SPI
++ * access. No-op if bring-up never filled the cache. */
++void CmdDispatcher_SendRfStatus(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN -x Debug -x _ide orig/fw/src/device_power.c fw/src/device_power.c
+--- orig/fw/src/device_power.c	2026-09-08 17:38:24.000000000 +0000
++++ fw/src/device_power.c	2026-10-01 09:05:59.687385796 +0000
+@@ -1,16 +1,22 @@
+ #include "device_power.h"
+ #include "board_config.h"
+-#include "sleep.h"   /* usleep() - Xilinx standalone BSP header, not <unistd.h> */
++#include "board_app.h" /* BoardApp_DelayUs()/BoardApp_ServiceRx() - waits below
++                         * keep draining the RS422/PC RX FIFO (polled mode), a
++                         * full AC sequence blocks ~250 ms otherwise */
+ #include <stdio.h>
+ 
+ void Device_UartSendString(XUartNs550 *instance, const char *str)
+ {
+     while (*str != '\0') {
+-        while (XUartNs550_IsSending(instance));
++        while (XUartNs550_IsSending(instance)) {
++            BoardApp_ServiceRx();
++        }
+         XUartNs550_Send(instance, (u8 *)str, 1);
+         str++;
+     }
+-    while (XUartNs550_IsSending(instance));
++    while (XUartNs550_IsSending(instance)) {
++        BoardApp_ServiceRx();
++    }
+ }
+ 
+ void Device_ControlACPwr(XUartNs550 *ac_uart, float voltage, float freq, int state)
+@@ -30,17 +36,17 @@
+     if (f_frac < 0) f_frac = -f_frac;
+ 
+     Device_UartSendString(ac_uart, "SYST:REM\r\n");
+-    usleep(50000);
++    BoardApp_DelayUs(50000);
+     Device_UartSendString(ac_uart, "PROT:MODE AC\r\n");
+-    usleep(50000);
++    BoardApp_DelayUs(50000);
+     snprintf(volt_cmd, sizeof(volt_cmd), "NORM:VOLT:AC %d.%d\r\n", v_int, v_frac);
+     Device_UartSendString(ac_uart, volt_cmd);
+-    usleep(50000);
++    BoardApp_DelayUs(50000);
+     snprintf(freq_cmd, sizeof(freq_cmd), "NORM:FREQ %d.%d\r\n", f_int, f_frac);
+     Device_UartSendString(ac_uart, freq_cmd);
+-    usleep(50000);
++    BoardApp_DelayUs(50000);
+     Device_UartSendString(ac_uart, state ? "OUTP ON\r\n" : "OUTP OFF\r\n");
+-    usleep(50000);
++    BoardApp_DelayUs(50000);
+ }
+ 
+ void Device_ControlDCPwr(XUartNs550 *dc_uart, float voltage, float current, int state)
+@@ -52,12 +58,12 @@
+     if (current > DC_MAX_CURRENT) current = DC_MAX_CURRENT;
+ 
+     Device_UartSendString(dc_uart, "#0 REN\r\n");
+-    usleep(50000);
++    BoardApp_DelayUs(50000);
+     snprintf(curr_cmd, sizeof(curr_cmd), "#0 ICN %.2f\r\n", (current / DC_MAX_CURRENT) * 100.0f);
+     Device_UartSendString(dc_uart, curr_cmd);
+-    usleep(10000);
++    BoardApp_DelayUs(10000);
+     Device_UartSendString(dc_uart, state ? "#0 SW1\r\n" : "#0 SW0\r\n");
+-    usleep(50000);
++    BoardApp_DelayUs(50000);
+     snprintf(volt_cmd, sizeof(volt_cmd), "#0 VCN %.2f\r\n", (voltage / DC_MAX_VOLTAGE) * 100.0f);
+     Device_UartSendString(dc_uart, volt_cmd);
+ }
+diff -ruN -x Debug -x _ide orig/fw/src/kria_helper.h fw/src/kria_helper.h
+--- orig/fw/src/kria_helper.h	2026-09-08 17:38:24.000000000 +0000
++++ fw/src/kria_helper.h	2026-10-01 09:11:48.630011323 +0000
+@@ -16,18 +16,20 @@
+  *              on this pairing. If a big-endian host is ever used instead,
+  *              this assumption must be revisited.
+  *
+- *          msgid map currently defined by the (already compiled/running) Qt
+- *          dashboard app - kept identical here for backward compatibility:
+- *            35  fwi_msg_t      AC power set/ack   (isAC = "AC")
+- *            36  fwi_msg_t      DC power set/ack   (isAC = "DC")
+- *            37  timedelay_msg_t Optical delay set/ack
+- *            38  annuation_msg_t Attenuator set/ack
+- *            39  cmd_msg_t      Generic/diag command (host->device) and
+- *                                ad-hoc streaming payloads (device->host,
+- *                                e.g. "WAVE" - see App dashboardmanager.cpp)
+- *          New msgid added by this firmware delivery:
+- *            40  adc7928_msg_t  ADC7928 8-channel telemetry report
+- *                                (device->host only)
++ *          msgid map (identical on both ends):
++ *            35  fwi_msg_t        AC power set/ack   (isAC = "AC")
++ *            36  fwi_msg_t        DC power set/ack   (isAC = "DC")
++ *            37  timedelay_msg_t  Optical delay set/ack
++ *            38  annuation_q_msg_t Attenuator set/ack, 0.25 dB resolution
++ *                                 (7-byte payload). The old 6-byte
++ *                                 annuation_msg_t (whole dB) is still
++ *                                 ACCEPTED by the firmware for backward
++ *                                 compatibility - see HandleAtt().
++ *            39  cmd_msg_t        Generic/diag command (host->device) and
++ *                                 device->host streams identified by a
++ *                                 4-byte magic: "WAVE" (RF FFT spectrum) and
++ *                                 "RFST" (rf_status_msg_t, AD9361 RX config)
++ *            40  adc7928_msg_t    ADC7928 8-channel telemetry (device->host)
+  ******************************************************************************/
+ #ifndef KRIA_HELPER_H
+ #define KRIA_HELPER_H
+@@ -39,12 +41,29 @@
+ 
+ #pragma pack(push, 1)
+ 
++/* LEGACY attenuator payload (6 bytes) - whole dB only. Kept so a Qt app
++ * built before the 0.25 dB change still works against this firmware
++ * (HandleAtt() tells the two apart by payload length). New senders must use
++ * annuation_q_msg_t below. */
+ typedef struct __annuation_msg {
+     char    msg[4];         /* "ATT" + NUL                                  */
+     uint8_t att_number;     /* 1, 2 or 3                                    */
+-    uint8_t value;          /* integer dB, 0..31 (see HW_SetAttenuation)    */
++    uint8_t value;          /* whole dB, 0..31                              */
+ } annuation_msg_t;
+ 
++/* Attenuator payload, 0.25 dB resolution (7 bytes). F1956 is 7-bit,
++ * 0.25 dB/step, 0..31.75 dB (board_config.h ATT_STEP_DB/ATT_MAX_STEPS), so
++ * the wire value is the step count directly: dB = value_qdb * 0.25,
++ * valid 0..127. A different LENGTH than the legacy struct on purpose: an
++ * older firmware that only knows the 6-byte struct rejects this one with a
++ * NACK (length check in HandleAtt()) instead of misreading the step count
++ * as whole dB and setting 4x the requested attenuation. */
++typedef struct __annuation_q_msg {
++    char     msg[4];        /* "ATQ" + NUL                                  */
++    uint8_t  att_number;    /* 1, 2 or 3                                    */
++    uint16_t value_qdb;     /* 0.25 dB steps, 0..127 (= 0..31.75 dB)         */
++} annuation_q_msg_t;
++
+ typedef struct __timedelay_msg {
+     char     msg[4];        /* "DEL" + NUL                                  */
+     uint16_t value;         /* delay in ns: 0 / 100 / 270 / 400              */
+@@ -54,9 +73,11 @@
+     char     msg[4];        /* "FWI" + NUL                                  */
+     char     isAC[3];       /* "AC" or "DC" + NUL                            */
+     uint16_t voltage;       /* volts, integer                                */
+-    uint16_t frequency;     /* AC: Hz*10 encoded by app as integer Hz;
+-                                DC: reused field carries current (A, integer
+-                                truncation - see README known-limitation)    */
++    uint16_t frequency;     /* AC: integer Hz.
++                                DC: reused field carries current, fixed-point
++                                x100 (centiamps): 2.35 A -> 235, decoded by
++                                dividing by 100.0f in HandleFwi(). Keep in
++                                sync with setDcPower() in the Qt app.        */
+     uint8_t  state;         /* 0 = OFF, 1 = ON                               */
+ } fwi_msg_t;
+ 
+@@ -65,18 +86,39 @@
+     uint8_t value[4];       /* up to 3 numeric args, 0xFF terminated         */
+ } cmd_msg_t;
+ 
+-/* New: ADC7928 8-channel telemetry (device -> host), msgid 40.
++/* ADC7928 8-channel telemetry (device -> host), msgid 40.
+  * raw_code[i] = 12-bit conversion result (0..4095) for physical channel i,
+- * straight-binary coding (CODING=1), input range 0..REFIN (RANGE=1) unless
+- * changed in device_adc7928.c. Voltage scaling (resistor divider on the
+- * "explosive trigger voltage" analog front-end) is NOT known to this
+- * firmware drop - see device_adc7928.h ADC7928_CH0_DIVIDER_RATIO TODO.
++ * straight-binary coding (CODING=1), input range 0..2*VREF
++ * (ADC7928_RANGE_0_TO_2VREF=1 in board_config.h, see device_adc7928.c).
++ * Voltage scaling (resistor divider on the "kich no" analog front-end) is
++ * NOT known yet - see board_config.h ADC7928_CH_DIVIDER_RATIO TODO.
+  */
+ typedef struct __adc7928_msg {
+     char     msg[4];        /* "ADC" + NUL                                  */
+     uint16_t raw_code[8];   /* 12-bit codes, one per channel, 0 if unread    */
+ } adc7928_msg_t;
+ 
++/* AD9361 RX configuration report (device -> host), msgid 39 with 4-byte
++ * magic "RFST" (no NUL - same convention as the "WAVE" stream). Values are
++ * the ones read back from the chip ONCE at the end of Ad9361_Bringup() in
++ * main.c (cached in g_rf_status, ad9361_phy.h) - nothing here touches the
++ * AD9361 over SPI at runtime (SPI0 is shared with the F1956 attenuators,
++ * see board_app.c SHARED-SPI-BUS NOTE). The Qt app uses rx_fs_hz/fft_size
++ * to put a real frequency axis under the "WAVE" spectrum and rx_lo_hz to
++ * show which RF frequency the receiver is actually tuned to. */
++typedef struct __rf_status_msg {
++    char     msg[4];        /* "RFST"                                       */
++    uint64_t rx_lo_hz;      /* RX LO (centre of the displayed spectrum)     */
++    uint32_t rx_fs_hz;      /* RX sample rate at the DMA interface          */
++    uint32_t rx_bw_hz;      /* RX analog RF bandwidth                       */
++    int32_t  rx1_gain_db;   /* RX1 gain read back from the chip             */
++    uint8_t  gain_mode;     /* enum rf_gain_ctrl_mode: 0=MGC 1=fast AGC
++                               2=slow AGC 3=hybrid AGC                       */
++    uint8_t  fft_size;      /* points per "WAVE" frame (32)                  */
++    uint8_t  adc_bits;      /* AD9361 ADC resolution (12)                    */
++    uint8_t  window;        /* 0 = rectangular (no window)                   */
++} rf_status_msg_t;
++
+ typedef struct _kria_message {
+     uint8_t seq;
+     uint8_t msgid;
+@@ -86,6 +128,17 @@
+ 
+ #pragma pack(pop)
+ 
++/* Wire-size guards - must match the other end of the link exactly (Qt
++ * backend/kria_helper.h <-> firmware src/kria_helper.h). A mismatch here is a
++ * protocol break, so fail the build instead of misparsing at runtime. */
++_Static_assert(sizeof(annuation_msg_t) == 6, "annuation_msg_t wire size changed");
++_Static_assert(sizeof(annuation_q_msg_t) == 7, "annuation_q_msg_t wire size changed");
++_Static_assert(sizeof(timedelay_msg_t) == 6, "timedelay_msg_t wire size changed");
++_Static_assert(sizeof(fwi_msg_t) == 12, "fwi_msg_t wire size changed");
++_Static_assert(sizeof(cmd_msg_t) == 68, "cmd_msg_t wire size changed");
++_Static_assert(sizeof(adc7928_msg_t) == 20, "adc7928_msg_t wire size changed");
++_Static_assert(sizeof(rf_status_msg_t) == 28, "rf_status_msg_t wire size changed");
++
+ typedef enum {
+     KRIA_STATE_IDLE = 0,
+     KRIA_STATE_GOT_SEQ,
+@@ -171,7 +224,7 @@
+         msg->len = (uint8_t)sizeof(timedelay_msg_t);
+         break;
+     case 38:
+-        msg->len = (uint8_t)sizeof(annuation_msg_t);
++        msg->len = (uint8_t)sizeof(annuation_q_msg_t);
+         break;
+     case 39:
+         msg->len = (uint8_t)sizeof(cmd_msg_t);
+diff -ruN -x Debug -x _ide orig/fw/src/main.c fw/src/main.c
+--- orig/fw/src/main.c	2026-09-11 14:45:44.000000000 +0000
++++ fw/src/main.c	2026-10-01 09:04:02.509482764 +0000
+@@ -37,10 +37,9 @@
+  *            2) BoardApp_Init()  - AC/DC power, F1956 attenuators, optical
+  *               delay, ADC7928, RS422/PC link (VIP+kria protocol).
+  *            3) BoardApp_PollOnce() in a superloop - services the RS422/PC
+- *               link and ADC7928 telemetry. AD9361 RF sampling/FFT/
+- *               detection is Phase 2 (see README.md) and is not driven from
+- *               this loop yet - g_ad9361_phy (ad9361_phy.h) is there for
+- *               whatever wires that in later.
++ *               link, ADC7928 telemetry and the RF spectrum stream
++ *               (stream_framer.c: RX1 DMA capture -> 32-pt FFT -> "WAVE",
++ *               plus the cached "RFST" RX-config report).
+  ******************************************************************************/
+ #include <stdio.h>
+ 
+@@ -397,8 +396,9 @@
+ 	&tx_dac_init,   // *tx_dac_init
+ };
+ 
+-/* Phase 2 hook - see ad9361_phy.h. */
++/* See ad9361_phy.h. */
+ struct ad9361_rf_phy *g_ad9361_phy = NULL;
++ad9361_rf_status_t    g_rf_status  = { 0 };
+ 
+ /* AD9361 bring-up. Local to main.c on purpose (see file header) - not a
+  * separate module. Returns XST_SUCCESS/XST_FAILURE. On failure, does not
+@@ -411,7 +411,9 @@
+     u8  lo_state;
+     u64 lo_freq;
+     u32 samp_freq, bandwidth;
++    u32 rx_samp_freq;
+     int32_t rx_gain;
++    uint8_t rx_gain_mode;
+ 
+     Xil_ICacheEnable();
+     Xil_DCacheEnable();
+@@ -465,6 +467,21 @@
+     xil_printf("AD9361: TX sampling frequency = %u Hz\r\n", (unsigned int)samp_freq);
+     ad9361_get_rx_rf_bandwidth(g_ad9361_phy, &bandwidth);
+     xil_printf("AD9361: RX RF bandwidth = %u Hz\r\n", (unsigned int)bandwidth);
++    ad9361_get_rx_sampling_freq(g_ad9361_phy, &rx_samp_freq);
++    xil_printf("AD9361: RX sampling frequency = %u Hz\r\n", (unsigned int)rx_samp_freq);
++    rx_gain_mode = 0U;
++    ad9361_get_rx_gain_control_mode(g_ad9361_phy, 0, &rx_gain_mode);
++
++    /* Cache the RX config NOW, while this code still owns SPI0 - the RF
++     * status report sent to the Qt app ("RFST", cmd_dispatcher.c) is built
++     * from this cache only, never from a live SPI read (see ad9361_phy.h). */
++    g_rf_status.rx_lo_hz    = (uint64_t)lo_freq;
++    g_rf_status.rx_fs_hz    = (uint32_t)rx_samp_freq;
++    g_rf_status.rx_bw_hz    = (uint32_t)bandwidth;
++    g_rf_status.rx1_gain_db = rx_gain;
++    g_rf_status.gain_mode   = rx_gain_mode;
++    g_rf_status.valid       = 1U;
++
+     xil_printf("AD9361: khoi tao xong.\r\n");
+ 
+     return XST_SUCCESS;
+diff -ruN -x Debug -x _ide orig/fw/src/stream_framer.c fw/src/stream_framer.c
+--- orig/fw/src/stream_framer.c	2026-09-11 15:49:58.000000000 +0000
++++ fw/src/stream_framer.c	2026-10-01 09:24:21.043782188 +0000
+@@ -6,21 +6,24 @@
+  ******************************************************************************/
+ #include "stream_framer.h"
+ #include "cmd_dispatcher.h"
++#include "board_app.h"
+ #include "parameters.h"
+ #include "axi_dmac.h"
+ #include "xil_cache.h"
+ #include "xstatus.h"
++#include "xtime_l.h"
+ #include <stdint.h>
+ #include <string.h>
+ #include <math.h>
+ 
+-#define RF_FFT_SIZE                     32U   /* points, complex - see file header */
+-#define RF_FFT_LOG2N                    5U    /* log2(32) */
++#define RF_FFT_SIZE                     STREAM_FRAMER_FFT_SIZE   /* points, complex - see stream_framer.h */
++#define RF_FFT_LOG2N                    STREAM_FRAMER_FFT_LOG2N  /* log2(32) */
+ #define RF_RX_CHANNELS                  4U    /* I1,Q1,I2,Q2 interleaved - 2R2T mode, rx_adc_init.num_channels in main.c */
+ #define RF_BYTES_PER_SAMPLE_COMPONENT   2U    /* 16-bit signed per I or per Q, matches ADI's AD9361_ADC_DAC_BYTES_PER_SAMPLE */
+ #define RF_CAPTURE_BYTES                (RF_FFT_SIZE * RF_RX_CHANNELS * RF_BYTES_PER_SAMPLE_COMPONENT) /* 32*4*2 = 256 */
+ 
+ #define RF_FFT_PI                       3.14159265358979323846f
++#define RF_DMA_TIMEOUT_MS               500U
+ 
+ /* DMA capture destination. NOT a dedicated DDR scratch region (this
+  * trimmed-down project's src/parameters.h has no ADC_DDR_BASEADDR, unlike
+@@ -115,6 +118,20 @@
+         return XST_FAILURE;
+     }
+ 
++    /* Polled DMA (IRQ_DISABLED): axi_dmac_transfer_wait_completion() in
++     * this no-OS version waits for IRQ_PENDING == SOT|EOT, but ONLY the ISR
++     * (axi_dmac_dev_to_mem_isr) ever clears that write-1-to-clear register
++     * - so from the 2nd capture on, the stale SOT|EOT of the previous
++     * capture made the wait return immediately, before the new transfer
++     * had necessarily landed. Clear it ourselves before every start. */
++    (void)axi_dmac_write(s_rx_dmac, AXI_DMAC_REG_IRQ_PENDING,
++                         AXI_DMAC_IRQ_SOT | AXI_DMAC_IRQ_EOT);
++
++    /* Clean+invalidate BEFORE the DMA writes the buffer, so no dirty cache
++     * line covering it (e.g. from the .bss zero-fill at boot) can be
++     * evicted on top of fresh DMA data later. Invalidate again after. */
++    Xil_DCacheFlushRange((INTPTR)s_rx_capture, RF_CAPTURE_BYTES);
++
+     memset(&rx_transfer, 0, sizeof(rx_transfer));
+     rx_transfer.size         = RF_CAPTURE_BYTES;
+     rx_transfer.transfer_done = false;
+@@ -126,9 +143,31 @@
+     if (status != 0) {
+         return XST_FAILURE;
+     }
+-    status = axi_dmac_transfer_wait_completion(s_rx_dmac, 500U);
+-    if (status != 0) {
+-        return XST_FAILURE;
++    /* Own completion poll instead of axi_dmac_transfer_wait_completion():
++     * that one sleeps in blind 1 ms steps (no_os_mdelay(1)) between checks,
++     * during which nothing drains the RS422/PC RX FIFO (polled mode, 16 bytes
++     * = ~1.4 ms at 115200) - host commands arriving then were lost. Here the
++     * RX FIFO keeps being serviced while waiting, with the same 500 ms
++     * timeout. */
++    {
++        XTime t0, now;
++        uint32_t pending = 0U;
++        const XTime timeout = ((XTime)COUNTS_PER_SECOND / 1000U) * (XTime)RF_DMA_TIMEOUT_MS;
++
++        XTime_GetTime(&t0);
++        for (;;) {
++            (void)axi_dmac_read(s_rx_dmac, AXI_DMAC_REG_IRQ_PENDING, &pending);
++            if ((pending & (AXI_DMAC_IRQ_SOT | AXI_DMAC_IRQ_EOT)) == (AXI_DMAC_IRQ_SOT | AXI_DMAC_IRQ_EOT)) {
++                break;
++            }
++            BoardApp_ServiceRx();
++            XTime_GetTime(&now);
++            if ((now - t0) > timeout) {
++                return XST_FAILURE;
++            }
++        }
++        /* Acknowledge (write-1-to-clear) right away as well. */
++        (void)axi_dmac_write(s_rx_dmac, AXI_DMAC_REG_IRQ_PENDING, pending);
+     }
+ 
+     /* DMA writes bypass the CPU cache - invalidate before reading, exactly
+diff -ruN -x Debug -x _ide orig/fw/src/stream_framer.h fw/src/stream_framer.h
+--- orig/fw/src/stream_framer.h	2026-09-11 15:49:58.000000000 +0000
++++ fw/src/stream_framer.h	2026-10-01 09:06:10.612885768 +0000
+@@ -50,6 +50,14 @@
+ 
+ #include "xstatus.h"
+ 
++/* Points per "WAVE" frame (also reported in "RFST" so the app knows the
++ * bin count without guessing). Must stay a power of two (radix-2 FFT) and
++ * <= 62 (wire budget, see cmd_dispatcher.h). */
++#define STREAM_FRAMER_FFT_SIZE      32U
++#define STREAM_FRAMER_FFT_LOG2N     5U
++#define STREAM_FRAMER_ADC_BITS      12U   /* AD9361 ADC, sign-extended to 16 bit by axi_adc */
++#define STREAM_FRAMER_WINDOW_RECT   0U
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff -ruN -x Debug -x _ide orig/fw/tools/vip_test_client.py fw/tools/vip_test_client.py
+--- orig/fw/tools/vip_test_client.py	2026-09-08 17:38:24.000000000 +0000
++++ fw/tools/vip_test_client.py	2026-10-01 09:19:39.168210929 +0000
+@@ -101,7 +101,15 @@
+     return b"DEL\x00" + struct.pack("<H", ns & 0xFFFF)
+ 
+ 
+-def build_att(channel: int, value_db: int) -> bytes:
++def build_att(channel: int, value_db: float) -> bytes:
++    """annuation_q_msg_t (7 bytes): value = number of 0.25 dB steps (0..127).
++    Same encoding as the Qt app's onAttUpdateRequested()."""
++    steps = max(0, min(127, int(round(value_db * 4))))
++    return b"ATQ\x00" + struct.pack("<BH", channel & 0xFF, steps)
++
++
++def build_att_legacy(channel: int, value_db: int) -> bytes:
++    """Old 6-byte annuation_msg_t (whole dB) - still accepted by the firmware."""
+     return b"ATT\x00" + bytes([channel & 0xFF, value_db & 0xFF])
+ 
+ 
+@@ -153,6 +161,13 @@
+             line += f" ADC7928 codes={codes}"
+         elif msgid in (35, 36, 37, 38) and len(body) >= 1:
+             line += f" ACK success={body[0]}"
++        elif msgid == 39 and body[:4] == b"WAVE":
++            mags = struct.unpack("<%dI" % ((len(body) - 4) // 4), body[4:4 + ((len(body) - 4) // 4) * 4])
++            k = max(range(len(mags)), key=lambda i: mags[i]) if mags else 0
++            line = line.split(" raw=")[0] + f" WAVE n={len(mags)} peak_bin={k} |X|={mags[k] if mags else 0})"
++        elif msgid == 39 and body[:4] == b"RFST" and len(body) >= 28:
++            lo, fs, bw, gain, mode, nfft, bits, win = struct.unpack("<QIIiBBBB", body[4:28])
++            line = line.split(" raw=")[0] + f" RFST LO={lo/1e6:.3f}MHz Fs={fs/1e6:.3f}MSPS BW={bw/1e6:.3f}MHz gain={gain}dB mode={mode} fft={nfft})"
+     return line
+ 
+ 
+@@ -168,12 +183,16 @@
+     p.add_argument("freq", type=int)
+     p.add_argument("state", type=int)
+ 
+-    p = sub.add_parser("dc", help="DC volts current state (current truncated to int, see README)")
++    p = sub.add_parser("dc", help="DC volts current_A state (current sent x100, e.g. 2.35)")
+     p.add_argument("volts", type=int)
+-    p.add_argument("current", type=int)
++    p.add_argument("current", type=float)
+     p.add_argument("state", type=int)
+ 
+-    p = sub.add_parser("att", help="ATT channel(1-3) value_db(0-31)")
++    p = sub.add_parser("att", help="ATT channel(1-3) value_db(0-31.75, 0.25 dB steps)")
++    p.add_argument("channel", type=int)
++    p.add_argument("value_db", type=float)
++
++    p = sub.add_parser("att_legacy", help="ATT channel(1-3) value_db(0-31) - old whole-dB 6-byte format")
+     p.add_argument("channel", type=int)
+     p.add_argument("value_db", type=int)
+ 
+@@ -196,11 +215,14 @@
+         inner = kria_encode(seq, 35, build_fwi("AC", args.volts, args.freq, args.state))
+         frame = vip_encode_data(NODE_FW, NODE_HOST, seq, inner)
+     elif args.cmd == "dc":
+-        inner = kria_encode(seq, 36, build_fwi("DC", args.volts, args.current, args.state))
++        inner = kria_encode(seq, 36, build_fwi("DC", args.volts, int(round(args.current * 100)), args.state))
+         frame = vip_encode_data(NODE_FW, NODE_HOST, seq, inner)
+     elif args.cmd == "att":
+         inner = kria_encode(seq, 38, build_att(args.channel, args.value_db))
+         frame = vip_encode_data(NODE_FW, NODE_HOST, seq, inner)
++    elif args.cmd == "att_legacy":
++        inner = kria_encode(seq, 38, build_att_legacy(args.channel, args.value_db))
++        frame = vip_encode_data(NODE_FW, NODE_HOST, seq, inner)
+     elif args.cmd == "delay":
+         inner = kria_encode(seq, 37, build_delay(args.ns))
+         frame = vip_encode_data(NODE_FW, NODE_HOST, seq, inner)

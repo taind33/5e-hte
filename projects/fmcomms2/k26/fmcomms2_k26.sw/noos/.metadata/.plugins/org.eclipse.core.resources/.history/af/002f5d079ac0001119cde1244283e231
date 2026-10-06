@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ASCII"?>
+<sdkproject:SdkProject xmi:version="2.0" xmlns:xmi="http://www.omg.org/XMI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:sdkproject="http://www.xilinx.com/sdkproject" name="5e_hte_app" location="D:/taind33/FPGA_Xilinx/ADI_v2/hdl/projects/fmcomms2/k26/fmcomms2_k26.sw/noos/5e_hte_app" platform="D:/taind33/FPGA_Xilinx/ADI_v2/hdl/projects/fmcomms2/k26/fmcomms2_k26.sw/noos/5e_hte_pf/export/5e_hte_pf/5e_hte_pf.xpfm" platformUID="xilinx:k26i::0.0(custom)" systemProject="5e_hte_app_system" sysConfig="5e_hte_pf" runtime="C/C++" cpu="standalone_domain" cpuInstance="psu_cortexa53_0" os="standalone" mssSignature="7680319f68408805fd10f32915524912">
+  <configuration name="Debug" id="xilinx.gnu.arm.a53.exe.debug.720859591">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+    <lastBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <configuration name="Release" id="xilinx.gnu.arm.a53.exe.release.1990988838" dirty="true">
+    <configBuildOptions xsi:type="sdkproject:SdkOptions"/>
+  </configuration>
+  <template appTemplateName="hello_world"/>
+</sdkproject:SdkProject>

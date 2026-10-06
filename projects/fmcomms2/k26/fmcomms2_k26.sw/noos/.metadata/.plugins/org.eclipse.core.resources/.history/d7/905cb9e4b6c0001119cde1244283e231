@@ -1,0 +1,593 @@
+#include "cmd_dispatcher.h"
+#include "vip_helper.h"
+#include "kria_helper.h"
+#include "device_power.h"
+#include "device_attenuator.h"
+#include "device_optical_delay.h"
+#include "board_config.h"
+#include "board_app.h"
+#include "ad9361_phy.h"
+#include "stream_framer.h"
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+
+/* Bench-supply UARTs are owned by device_power.c (PowerLink_Init()); NULL
+ * there = that supply's UART failed to initialize -> its commands NACK. */
+static XUartNs550 *s_pc_uart;
+static int         s_att_ready  = 0;
+static int         s_odly_ready = 0;
+
+static vip_status_t s_vip_status;
+static vip_msg_t    s_vip_rx;
+
+static uint8_t s_tx_frame[VIP_MAX_FRAME_LEN];
+
+static void SendMsg39(const uint8_t *payload, uint8_t len, uint8_t *seq);
+
+/* PC-link health counters (reported in "DIAG"). */
+static uint32_t s_pc_rx_bytes   = 0U;
+static uint32_t s_pc_frames_ok  = 0U;
+static uint32_t s_pc_frames_bad = 0U;
+
+void CmdDispatcher_Init(XUartNs550 *pc_uart)
+{
+    s_pc_uart = pc_uart;
+    VIP_Decode_Init(&s_vip_status);
+}
+
+void CmdDispatcher_GetLinkStats(uint32_t *rx_bytes, uint32_t *frames_ok, uint32_t *frames_bad)
+{
+    *rx_bytes   = s_pc_rx_bytes;
+    *frames_ok  = s_pc_frames_ok;
+    *frames_bad = s_pc_frames_bad;
+}
+
+void CmdDispatcher_SetDeviceReady(int att_ready, int odly_ready)
+{
+    s_att_ready  = att_ready;
+    s_odly_ready = odly_ready;
+}
+
+/* Raw byte-accurate blocking send (payload may contain 0x00, so this can't
+ * be a NUL-terminated Device_UartSendString() call). */
+static void UartRaw_Send(XUartNs550 *u, const uint8_t *buf, uint32_t len)
+{
+    uint32_t i;
+
+    if (u == NULL) {
+        return;
+    }
+    /* Keep draining the host->board RX FIFO while we wait on TX (polled RX
+     * mode) - a 150-byte "WAVE" frame alone blocks ~13 ms at 115200 baud,
+     * far longer than the 16-byte RX FIFO lasts (~1.4 ms). */
+    for (i = 0U; i < len; i++) {
+        while (XUartNs550_IsSending(u)) {
+            BoardApp_ServiceRx();
+        }
+        XUartNs550_Send(u, (u8 *)&buf[i], 1);
+    }
+    while (XUartNs550_IsSending(u)) {
+        BoardApp_ServiceRx();
+    }
+}
+
+static void SendAck(uint8_t des_id, uint16_t frame_seq, uint8_t inner_seq, uint8_t msgid, uint8_t success)
+{
+    kria_message_t ack_msg;
+    uint8_t        inner[3 + 1];
+    uint16_t       inner_len;
+    uint32_t       frame_len;
+
+    kria_msg_build_ack((int)inner_seq, (int)msgid, success, &ack_msg);
+    inner_len = kria_msg_to_send_buffer(inner, &ack_msg);
+
+    frame_len = VIP_Encode_Data(des_id, VIP_NODE_ID_SELF, frame_seq,
+                                 inner, inner_len, s_tx_frame, sizeof(s_tx_frame));
+    if (frame_len > 0U) {
+        UartRaw_Send(s_pc_uart, s_tx_frame, frame_len);
+    }
+}
+
+static void HandleFwi(const kria_message_t *msg, uint8_t src_id, uint16_t frame_seq)
+{
+    fwi_msg_t       fwi;
+    power_ack_ctx_t ack;
+
+    if (msg->len != (uint8_t)sizeof(fwi_msg_t)) {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+    memcpy(&fwi, msg->payload64, sizeof(fwi_msg_t));
+
+    /* The ACK is NOT sent here any more: it goes out from
+     * CmdDispatcher_PollPower() once the supply itself has confirmed the
+     * new state (SYST:ERR? clean + OUTP? == requested for AC; replied for
+     * DC), together with a msgid 42 status carrying the measured values.
+     * A supply whose UART failed to initialize completes immediately with
+     * PWR_RESULT_NOT_READY -> NACK, as before. */
+    ack.has_ack   = 1U;
+    ack.des_id    = src_id;
+    ack.inner_seq = msg->seq;
+    ack.msgid     = msg->msgid;
+    ack.frame_seq = frame_seq;
+
+    if (strncmp(fwi.isAC, "AC", 2) == 0) {
+        PowerLink_StartAcSet((float)fwi.voltage, (float)fwi.frequency, fwi.state, &ack);
+    } else if (strncmp(fwi.isAC, "DC", 2) == 0) {
+        /* The Qt app packs DC current into the same "frequency" field of
+         * fwi_msg_t (see dashboardmanager.cpp setDcPower()) as fixed-point
+         * x100 (centiamps), e.g. 2.35 A -> 235. */
+        PowerLink_StartDcSet((float)fwi.voltage, (float)fwi.frequency / 100.0f, fwi.state, &ack);
+    } else {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+    }
+}
+
+/* msgid 43: raw text command for one supply - answered by msgid 44. */
+static void HandlePwrRaw(const kria_message_t *msg, uint8_t src_id, uint16_t frame_seq)
+{
+    pwr_raw_msg_t r;
+    uint32_t      i;
+
+    if (msg->len != (uint8_t)sizeof(pwr_raw_msg_t)) {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+    memcpy(&r, msg->payload64, sizeof(r));
+    r.text[PWR_RAW_TEXT_MAX - 1U] = '\0';
+    /* Printable ASCII only - a raw command must not inject a line break. */
+    for (i = 0U; r.text[i] != '\0'; i++) {
+        if ((r.text[i] < 0x20) || (r.text[i] > 0x7E)) {
+            SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+            return;
+        }
+    }
+    if (((r.dev != PWR_DEV_AC) && (r.dev != PWR_DEV_DC)) || (r.text[0] == '\0')) {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+    PowerLink_StartRaw(r.dev, r.text);
+}
+
+/* msgid 41: "refresh" - read one supply now. Answered by a msgid 42 status
+ * (no ACK on success); a malformed request is NACKed. */
+static void HandlePwrQuery(const kria_message_t *msg, uint8_t src_id, uint16_t frame_seq)
+{
+    pwr_query_msg_t q;
+
+    if (msg->len != (uint8_t)sizeof(pwr_query_msg_t)) {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+    memcpy(&q, msg->payload64, sizeof(q));
+    if ((q.dev != PWR_DEV_AC) && (q.dev != PWR_DEV_DC)) {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+    PowerLink_StartRead(q.dev);
+}
+
+static void HandleDelay(const kria_message_t *msg, uint8_t src_id, uint16_t frame_seq)
+{
+    timedelay_msg_t d;
+    uint8_t         success;
+
+    if (msg->len != (uint8_t)sizeof(timedelay_msg_t)) {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+    if (!s_odly_ready) {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+    memcpy(&d, msg->payload64, sizeof(timedelay_msg_t));
+    success = (uint8_t)OpticalDelay_SetNs((int)d.value);
+    SendAck(src_id, frame_seq, msg->seq, msg->msgid, success);
+}
+
+static void HandleAtt(const kria_message_t *msg, uint8_t src_id, uint16_t frame_seq)
+{
+    uint8_t att_number;
+    float   db;
+
+    /* Two payload formats, told apart by length (see kria_helper.h):
+     *  - 7 bytes annuation_q_msg_t: value_qdb = 0.25 dB steps (current app)
+     *  - 6 bytes annuation_msg_t:   value = whole dB (older app builds)
+     * Anything else, an out-of-range channel, or an out-of-range step count
+     * is NACKed rather than clamped, so a malformed or mismatched command can
+     * never silently land on a different attenuation than the operator asked
+     * for. */
+    if (msg->len == (uint8_t)sizeof(annuation_q_msg_t)) {
+        annuation_q_msg_t q;
+        memcpy(&q, msg->payload64, sizeof(q));
+        if (q.value_qdb > ATT_MAX_STEPS) {
+            SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+            return;
+        }
+        att_number = q.att_number;
+        db = (float)q.value_qdb * ATT_STEP_DB;
+    } else if (msg->len == (uint8_t)sizeof(annuation_msg_t)) {
+        annuation_msg_t a;
+        memcpy(&a, msg->payload64, sizeof(a));
+        if ((float)a.value > ATT_MAX_DB) {
+            SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+            return;
+        }
+        att_number = a.att_number;
+        db = (float)a.value;
+    } else {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+
+    if (!s_att_ready || (att_number < 1U) || (att_number > 3U)) {
+        SendAck(src_id, frame_seq, msg->seq, msg->msgid, 0U);
+        return;
+    }
+    Attenuator_SetDb((int)att_number, db);
+    SendAck(src_id, frame_seq, msg->seq, msg->msgid, 1U);
+}
+
+static void HandleGenericCmd(const kria_message_t *msg, uint8_t src_id, uint16_t frame_seq)
+{
+    /* Generic/diagnostic command channel (msgid 39, host->device). Most
+     * commands here still just get ACKed (no action defined) so the "CMD:"
+     * box in CommandLogPanel.qml gets a response. Device -> host traffic on
+     * msgid 39 ("WAVE"/"RFST" streams) is sent by the functions at the end
+     * of this file, never received here.
+     *
+     * "RESET" is now implemented: it restores every output this board
+     * controls to its power-on-safe default (AC/DC OFF, all 3 ATT to
+     * 0 dB, optical delay to 0 ns) - the same convention as SCPI *RST on a
+     * bench instrument. Deliberately NOT a CPU/board reboot
+     * (Xil_SystemReset()): a real reboot would drop this very RS422 link
+     * mid-command and leave the operator with no feedback that anything
+     * happened. If a hard reboot is actually what's wanted here instead,
+     * that needs its own explicit msgid/confirmation, not silent reuse of
+     * this one. */
+    cmd_msg_t cmd;
+    uint8_t   success = 1U;
+
+    if (msg->len == (uint8_t)sizeof(cmd_msg_t)) {
+        memcpy(&cmd, msg->payload64, sizeof(cmd_msg_t));
+
+        if (strncmp(cmd.msg, "RESET", 5) == 0) {
+            /* Only touch devices that initialized; report failure if any
+             * output could not be returned to its safe default. */
+            success = 1U;
+            /* Supplies: output OFF as a confirmed transaction each - the
+             * app gets a msgid 42 per supply (reason RESET) with the real
+             * output state once the supply has answered. */
+            if (!PowerLink_IsReady(PWR_DEV_AC)) {
+                success = 0U;
+            }
+            PowerLink_StartOff(PWR_DEV_AC);
+            if (!PowerLink_IsReady(PWR_DEV_DC)) {
+                success = 0U;
+            }
+            PowerLink_StartOff(PWR_DEV_DC);
+            if (s_att_ready) {
+                Attenuator_SetDb(1, 0.0f);
+                Attenuator_SetDb(2, 0.0f);
+                Attenuator_SetDb(3, 0.0f);
+            } else {
+                success = 0U;
+            }
+            if (s_odly_ready) {
+                (void)OpticalDelay_SetNs(0);
+            } else {
+                success = 0U;
+            }
+        }
+    }
+    SendAck(src_id, frame_seq, msg->seq, msg->msgid, success);
+}
+
+void CmdDispatcher_HandleByte(uint8_t byte)
+{
+    uint8_t got;
+
+    s_pc_rx_bytes++;
+    xil_printf("%02X ", byte);                               /* DEBUG RX */
+    /* VIP_Decode() only ever WRITES last_error (on a CRC/header error, then
+     * resyncs) - clearing it per byte turns it into a per-frame error flag. */
+    s_vip_status.last_error = VIP_ERR_NONE;
+    got = VIP_Decode(&s_vip_rx, &s_vip_status, byte);
+    if (s_vip_status.last_error != VIP_ERR_NONE) {
+        s_pc_frames_bad++;
+    }
+    if (!got) {
+        return;
+    }
+    s_pc_frames_ok++;
+
+    {
+        uint32_t reply_len = 0U;
+        vip_process_result_t result = VIP_Process_Frame(&s_vip_rx, s_tx_frame, sizeof(s_tx_frame), &reply_len);
+
+        switch (result) {
+        case VIP_PROCESS_REPLY_READY:
+            /* Auto-ACK for a PING_STD request, already encoded into
+             * s_tx_frame by VIP_Process_Frame(). */
+            UartRaw_Send(s_pc_uart, s_tx_frame, reply_len);
+            /* Host is talking to us: on a (re)connect the board replays its
+             * boot log + health report (board_app.c). */
+            BoardApp_OnHostPing();
+            break;
+
+        case VIP_PROCESS_DATA_READY: {
+            const kria_message_t *msg = &s_vip_rx.msg;
+            uint8_t  src_id    = s_vip_rx.header.srcId;
+            uint16_t frame_seq = s_vip_rx.header.frameSeq;
+
+            switch (msg->msgid) {
+            case 35: /* AC */
+            case 36: /* DC */
+                HandleFwi(msg, src_id, frame_seq);
+                break;
+            case 37: /* Optical delay */
+                HandleDelay(msg, src_id, frame_seq);
+                break;
+            case 38: /* Attenuator */
+                HandleAtt(msg, src_id, frame_seq);
+                break;
+            case 39: /* Generic/diag */
+                HandleGenericCmd(msg, src_id, frame_seq);
+                break;
+            case 41: /* Supply readback request */
+                HandlePwrQuery(msg, src_id, frame_seq);
+                break;
+            case 43: /* Raw supply command (app terminal) */
+                HandlePwrRaw(msg, src_id, frame_seq);
+                break;
+            default:
+                /* Unknown msgid - silently ignored (no ACK defined). */
+                break;
+            }
+            break;
+        }
+
+        case VIP_PROCESS_FORWARD:
+        case VIP_PROCESS_IGNORE:
+        default:
+            break;
+        }
+    }
+}
+
+void CmdDispatcher_SendAdcTelemetry(const uint16_t codes[8])
+{
+    adc7928_msg_t   adc_data;
+    kria_message_t  tx_msg;
+    uint8_t         inner[3 + sizeof(adc7928_msg_t)];
+    uint16_t        inner_len;
+    uint32_t        frame_len;
+    static uint8_t  seq = 0U;
+
+    memset(&adc_data, 0, sizeof(adc_data));
+    strncpy(adc_data.msg, "ADC", sizeof(adc_data.msg));
+    memcpy(adc_data.raw_code, codes, sizeof(adc_data.raw_code));
+
+    kria_msg_output_encode((int)seq++, 40, &adc_data, &tx_msg);
+    inner_len = kria_msg_to_send_buffer(inner, &tx_msg);
+
+    frame_len = VIP_Encode_Data(VIP_NODE_ID_HOST, VIP_NODE_ID_SELF, VIP_NextTxSeq(),
+                                 inner, inner_len, s_tx_frame, sizeof(s_tx_frame));
+    if (frame_len > 0U) {
+        UartRaw_Send(s_pc_uart, s_tx_frame, frame_len);
+    }
+}
+
+void CmdDispatcher_SendWaveDb(const int16_t *db100, uint32_t count, uint8_t window)
+{
+    /* "WAVD" (msgid 39): 4-byte magic, n, window, n x int16 LE (dBFS x100).
+     * Built by hand: kria_msg_output_encode() hardcodes msgid 39 to
+     * sizeof(cmd_msg_t). n is clamped to what fits one payload (124). */
+    static uint8_t seq = 0U;
+    uint8_t  buf[KRIA_MAX_PAYLOAD_LEN];
+    uint32_t i;
+    const uint32_t max_count = (KRIA_MAX_PAYLOAD_LEN - 6U) / 2U;
+
+    if (count > max_count) {
+        count = max_count;
+    }
+    memcpy(buf, "WAVD", 4U);
+    buf[4] = (uint8_t)count;
+    buf[5] = window;
+    for (i = 0U; i < count; i++) {
+        uint16_t v = (uint16_t)db100[i];
+        buf[6U + 2U * i]      = (uint8_t)(v & 0xFFU);
+        buf[6U + 2U * i + 1U] = (uint8_t)(v >> 8U);
+    }
+    SendMsg39(buf, (uint8_t)(6U + 2U * count), &seq);
+}
+
+void CmdDispatcher_SendRfStatus(void)
+{
+    rf_status_msg_t st;
+    kria_message_t  tx_msg;
+    uint8_t         inner[3 + sizeof(rf_status_msg_t)];
+    uint16_t        inner_len;
+    uint32_t        frame_len;
+    static uint8_t  seq = 0U;
+
+    if (!g_rf_status.valid) {
+        return;     /* AD9361 bring-up never completed - nothing to report */
+    }
+
+    memset(&st, 0, sizeof(st));
+    memcpy(st.msg, "RFST", 4U);
+    st.rx_lo_hz    = g_rf_status.rx_lo_hz;
+    st.rx_fs_hz    = g_rf_status.rx_fs_hz;
+    st.rx_bw_hz    = g_rf_status.rx_bw_hz;
+    st.rx1_gain_db = g_rf_status.rx1_gain_db;
+    st.gain_mode   = g_rf_status.gain_mode;
+    st.fft_size    = (uint8_t)STREAM_FRAMER_FFT_SIZE;
+    st.adc_bits    = (uint8_t)STREAM_FRAMER_ADC_BITS;
+    st.window      = (uint8_t)STREAM_FRAMER_WINDOW_RECT;
+
+    /* Built by hand (fixed 28-byte payload) for the same reason as "WAVE":
+     * kria_msg_output_encode() hardcodes msgid 39 to sizeof(cmd_msg_t). */
+    tx_msg.seq   = seq++;
+    tx_msg.msgid = 39U;
+    tx_msg.len   = (uint8_t)sizeof(rf_status_msg_t);
+    memcpy(tx_msg.payload64, &st, sizeof(st));
+
+    inner_len = kria_msg_to_send_buffer(inner, &tx_msg);
+    frame_len = VIP_Encode_Data(VIP_NODE_ID_HOST, VIP_NODE_ID_SELF, VIP_NextTxSeq(),
+                                 inner, inner_len, s_tx_frame, sizeof(s_tx_frame));
+    if (frame_len > 0U) {
+        UartRaw_Send(s_pc_uart, s_tx_frame, frame_len);
+    }
+}
+
+static int32_t ToMilli(float v)
+{
+    float m = v * 1000.0f;
+
+    if (m > 2.0e9f) {
+        return INT32_MAX;
+    }
+    if (m < -2.0e9f) {
+        return INT32_MIN;
+    }
+    return (int32_t)lroundf(m);
+}
+
+static void SendPwrStatus(const power_result_t *r)
+{
+    pwr_status_msg_t st;
+    kria_message_t   tx_msg;
+    uint8_t          inner[3 + sizeof(pwr_status_msg_t)];
+    uint16_t         inner_len;
+    uint32_t         frame_len;
+    static uint8_t   seq = 0U;
+
+    memset(&st, 0, sizeof(st));
+    memcpy(st.msg, "PWS", 4U);
+    st.dev      = r->dev;
+    st.reason   = r->reason;
+    st.result   = r->result;
+    st.output   = r->output;
+    st.valid    = r->valid;
+    st.req_seq  = r->ack.has_ack ? r->ack.inner_seq : 0U;
+    st.dev_err  = r->dev_err;
+    st.volt_mv  = ToMilli(r->volt);
+    st.curr_ma  = ToMilli(r->curr);
+    st.freq_mhz = ToMilli(r->freq);
+
+    kria_msg_output_encode((int)seq++, 42, &st, &tx_msg);
+    inner_len = kria_msg_to_send_buffer(inner, &tx_msg);
+    frame_len = VIP_Encode_Data(VIP_NODE_ID_HOST, VIP_NODE_ID_SELF, VIP_NextTxSeq(),
+                                 inner, inner_len, s_tx_frame, sizeof(s_tx_frame));
+    if (frame_len > 0U) {
+        UartRaw_Send(s_pc_uart, s_tx_frame, frame_len);
+    }
+}
+
+static void SendPwrRawReply(const power_result_t *r)
+{
+    pwr_raw_reply_msg_t m;
+    kria_message_t      tx_msg;
+    uint8_t             inner[3 + sizeof(pwr_raw_reply_msg_t)];
+    uint16_t            inner_len;
+    uint32_t            frame_len;
+    static uint8_t      seq = 0U;
+
+    memset(&m, 0, sizeof(m));
+    memcpy(m.msg, "RAWR", 4U);
+    m.dev     = r->dev;
+    m.result  = r->result;
+    m.output  = r->output;
+    m.valid   = r->valid;
+    m.dev_err = r->dev_err;
+    if (r->has_raw_reply) {
+        size_t n = strlen(r->raw_reply);
+        if (n > (PWR_RAW_REPLY_MAX - 1U)) {
+            n = PWR_RAW_REPLY_MAX - 1U;
+        }
+        memcpy(m.text, r->raw_reply, n);
+        m.len = (uint8_t)n;
+    }
+    kria_msg_output_encode((int)seq++, 44, &m, &tx_msg);
+    inner_len = kria_msg_to_send_buffer(inner, &tx_msg);
+    frame_len = VIP_Encode_Data(VIP_NODE_ID_HOST, VIP_NODE_ID_SELF, VIP_NextTxSeq(),
+                                 inner, inner_len, s_tx_frame, sizeof(s_tx_frame));
+    if (frame_len > 0U) {
+        UartRaw_Send(s_pc_uart, s_tx_frame, frame_len);
+    }
+}
+
+void CmdDispatcher_PollPower(void)
+{
+    power_result_t r;
+
+    while (PowerLink_Poll(&r)) {
+        /* Status first, then the ACK it confirms, so the app already holds
+         * the confirmed output state when it processes the ACK. A
+         * superseded (aborted) transaction carries no data - only its ACK
+         * (as a failure) goes out. */
+        if (r.reason == PWR_REASON_RAW) {
+            SendPwrRawReply(&r);
+            continue;
+        }
+        if (r.result != PWR_RESULT_ABORTED) {
+            SendPwrStatus(&r);
+        }
+        if (r.ack.has_ack) {
+            SendAck(r.ack.des_id, r.ack.frame_seq, r.ack.inner_seq, r.ack.msgid,
+                    (r.result == PWR_RESULT_OK) ? 1U : 0U);
+        }
+    }
+}
+
+/* Builds a device->host frame on msgid 39 with an arbitrary payload (the
+ * "RFST"/"DIAG"/"LOGT" streams - kria_msg_output_encode() hardcodes msgid 39
+ * to sizeof(cmd_msg_t), so these are built by hand). */
+static void SendMsg39(const uint8_t *payload, uint8_t len, uint8_t *seq)
+{
+    kria_message_t  tx_msg;
+    uint8_t         inner[3 + KRIA_MAX_PAYLOAD_LEN];
+    uint16_t        inner_len;
+    uint32_t        frame_len;
+
+    tx_msg.seq   = (*seq)++;
+    tx_msg.msgid = 39U;
+    tx_msg.len   = len;
+    memcpy(tx_msg.payload64, payload, len);
+    inner_len = kria_msg_to_send_buffer(inner, &tx_msg);
+    frame_len = VIP_Encode_Data(VIP_NODE_ID_HOST, VIP_NODE_ID_SELF, VIP_NextTxSeq(),
+                                 inner, inner_len, s_tx_frame, sizeof(s_tx_frame));
+    if (frame_len > 0U) {
+        UartRaw_Send(s_pc_uart, s_tx_frame, frame_len);
+    }
+}
+
+void CmdDispatcher_SendDiag(const board_diag_msg_t *d)
+{
+    static uint8_t seq = 0U;
+
+    if (s_pc_uart == NULL) {
+        return;
+    }
+    SendMsg39((const uint8_t *)d, (uint8_t)sizeof(*d), &seq);
+}
+
+void CmdDispatcher_SendLog(uint8_t level, const char *text)
+{
+    static uint8_t seq = 0U;
+    uint8_t  buf[5U + BOARD_LOG_MAX_TEXT];
+    uint32_t n = (uint32_t)strlen(text);
+
+    if (s_pc_uart == NULL) {
+        return;
+    }
+    if (n > BOARD_LOG_MAX_TEXT) {
+        n = BOARD_LOG_MAX_TEXT;
+    }
+    memcpy(buf, "LOGT", 4U);
+    buf[4] = level;
+    memcpy(&buf[5], text, n);
+    SendMsg39(buf, (uint8_t)(5U + n), &seq);
+}

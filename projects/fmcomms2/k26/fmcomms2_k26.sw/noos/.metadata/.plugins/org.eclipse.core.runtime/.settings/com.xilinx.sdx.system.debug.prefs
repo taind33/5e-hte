@@ -1,0 +1,16 @@
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.bss=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.data=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.data1=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.fixup=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.rodata=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.rodata1=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.sbss=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.sbss2=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.sdata=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.sdata2=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:.text=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:heap=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:heap-size=131072
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:stack=psu_ddr_0_MEM_0
+com.xilinx.sdk.linkgen.prefs.5e_hte_app\:stack-size=131072
+eclipse.preferences.version=1
